@@ -1,0 +1,740 @@
+proc import datafile ="crsp.csv"
+	out = crsp_raw
+	dbsm = csv
+	replace;
+	guessingrows = max;
+	getnames = yes;
+run;
+
+proc import datafile = "compustat.csv"
+	out = compustat_raw
+	dbms = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+run;
+
+proc import datafile = "ccm_link.csv"
+	out = ccm_raw
+	dbms = csv
+	replace; 
+	getnames = yes;
+	guessingrows = max;
+run;
+
+proc datasets lib=work; run;
+
+proc print data = work.ccm_raw (obs=10);
+run;
+
+
+%let START_DATE = '01JAN2019';
+%let END_DATE   = '31DEC2024';
+%let START_YEAR = '2019';
+%let END_YEAR = '2024';
+
+
+
+
+
+/* Clean CRSP filter by year */
+
+data crsp;
+	set crsp_raw;
+	calyear = year(MthCalDt);  /*create year variable*/
+	format MthCalDt date9.;
+	if &START_YEAR <= calyear <= &END_YEAR;
+
+run;
+
+/* Clean CCM link */
+
+data ccm;
+	set ccm_raw; /* imported ccm link */
+
+	/*convert character dates into numeric sas dates*/
+
+	linkdt_num = input(strip(linkdt), anydtdte.);
+	linkenddt_num = input(strip(linkenddt), anydtdte.);
+
+	/* handle open ended end dates */
+
+	if missing(linkenddt_num) then linkenddt_num = '31DEC9999'd;
+
+
+
+	/* keep only common equity link types */
+	if linktype in ("LC", "LU", "LS");
+
+	/*fill open eded linkedndt  if missing*/
+
+	if missing(linkenddt) the  linkenddt = '31DEC9999'd;
+
+	format linkdt_num linkenddt_num date9.;
+	drop linkdt linkenddt;
+	rename linkdt_num = linkdt linkenddt_num = linkenddt;
+
+run;
+
+
+/* Merge CRSP with CCM (Attach GVKEY by date validity) */
+
+proc sql;
+	create table crsp_ccm  as 
+	select a.*, b.gvkey
+	from crsp as a 
+	inner join ccm as b
+		on a.permno = b.lpermno
+		and a.MthCalDt between b.linkdt and b.linkenddt
+	;
+quit;
+
+
+/* collapse to one row per permno-year (last obs in year) */
+
+proc sort data=crsp_ccm; by permno calyear MthCalDt; run;
+
+data crsp_ccm_year;
+
+	set crsp_ccm;
+	by permno calyear;
+	if last.calyear;  /* keep last month in each year */
+
+run;
+
+
+/* merge with compustat */
+
+proc sort data=compustat_raw nodupkey; by gvkey fyear; run;
+
+proc sql;
+
+	create table spine_step1 as 
+	select a.*, b.*
+	from crsp_ccm_year as a
+	left join compustat_raw as b
+		on a.gvkey = b.gvkey
+		and a.calyear = b.fyear
+	;
+
+quit; 
+
+
+
+/* export the merged crsp + ccm + compustat data */
+
+proc export data = spine_step1
+
+	outfile = "C:\Users\ma2281\OneDrive - UNT System\Desktop\Week 5 Assignment\crsp_ccm_compustat.csv"
+
+	dbms = csv
+	replace;
+
+run;
+
+
+/* import ibes-crsp link */
+
+proc import datafile="ibes_crsp_link.csv"
+	out = ibeslink_raw
+	dbms = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+run;
+
+/*keep score=1 only (best matches) */
+
+data ibeslink;
+	set ibeslink_raw;
+	if score = 1;
+	ibesticker = upcase(ticker); /*create new variable for ibes ticker */
+	drop ticker;
+
+run;
+
+/* import ibes price target */
+
+proc import datafile = "ibes_price_target.csv"
+	out = ibes_raw
+	dbms = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+
+run;
+
+/* clean ibes exclude disclosed earners, filter years, rename ticker */
+
+data ibes;
+	set ibes_raw;
+	ibesticker = upcase(ticker);
+	drop ticker;
+
+	/*convert announcement date */
+
+	anndate = input(strip(anndats), anydtdte.);
+	format anndate date9.;
+
+	/* exclude disclosed earners if flag exists */
+
+	if missing(disclosed_earn) or disclosed_earn = 0;
+
+	year = year(anndate);
+	if &START_YEAR <= year <= &END_YEAR;
+
+run;
+
+
+/* merge ibes with crsp link (permno -> ibesticker) */
+
+proc sql;
+	create table ibes_join as
+	select a.permno, a.gvkey, a.calyear,
+		l.ibesticker,
+		i.cusip,
+        i.oftic,
+        i.cname,
+        i.statpers,
+        i.numest,
+        i.numup4w,
+        i.numdown4w,
+        i.numup1m,
+        i.numdown1m,
+        i.meanptg,
+        i.medptg,
+        i.stdev,
+        i.ptghigh,
+        i.ptglow,
+        i.curr,
+        i.usfirm,
+        i.anndate,
+        i.year as ibes_year
+	from spine_step1 as a  /* crsp + ccm + compustat spine */
+	inner join ibeslink as l
+		on a.permno = l.permno
+	left join ibes as i
+		on l.ibesticker = i.ibesticker
+		and a.calyear = i.year
+	;
+quit;
+
+/* collapse ibes to firm -year; keep the lastest statpers per year */
+
+proc sort data=ibes_join; by permno calyear anndate; run;
+
+data ibes_year;
+
+	set ibes_join;
+	by permno calyear;
+	if last.calyear;  /*keep the most recent record in that year */
+
+run;
+
+/*merge into spine: create spine_step2 */
+
+proc sql;
+
+	create table spine_step2 as
+	select a.*,
+		b.ibesticker,
+		b.cusip,
+        b.oftic,
+        b.cname,
+        b.statpers,
+        b.numest,
+        b.numup4w,
+        b.numdown4w,
+        b.numup1m,
+        b.numdown1m,
+        b.meanptg,
+        b.medptg,
+        b.stdev,
+        b.ptghigh,
+        b.ptglow,
+        b.curr,
+        b.usfirm,
+        b.anndate
+	from spine_step1 as a 
+	left join ibes_year as b
+		on a.permno = b.permno
+		and a.calyear = b.calyear;
+quit;
+
+
+/* add sdc m&a */
+
+/*import sdc m&a */
+
+proc import datafile = "sdc_ma.csv"
+	out = sdc_raw
+	dbms = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+
+run;
+
+
+
+
+
+/* standardize cusip and dates */
+
+data sdc_clean;
+/*proc contents data = sdc_clean; run;*/
+	set sdc_raw;
+	length master_cusip8 acq_cusip8 $8;  /*force char (8) */
+
+/*target cusip as char (8) */
+	if vtype(master_cusip)='N' then do;
+		_t = right(put(master_cusip, 8.));  /*right align in 8 chars */
+		master_cusip8 = translate(_t, '0', ''); /* replace leading spaces with 0s */
+
+	end;
+	else master_cusip8 = substr(compress(upcase(strip(master_cusip)),'-.'),1,8);
+
+	/* target cusip -> char(8) */
+
+	if vtype(master_cusip) ='N' then do;
+		_t = right(put(master_cusip,8.)); /*right-align in 8 chards */
+		master_cusip8 = translate(_t, '0', ''); /*replace leading spaces with 0s */
+	end;
+	else master_cusip8 = substr(compress(upcase(strip(master_cusip)),'-.'),1,8);
+
+	/* acquirer cusip -> char(8) */
+
+	if vtype(acusip) = 'N' then do;
+
+		_u = right(put(acusip, 8.));
+		acq_cusip8 = translate(_u, '0', '');
+	end;
+	else acq_cusip8 = substr(compress(upcase(strip(acusip)),'-.'),1,8);
+
+	/* dates + numeric year */
+
+	ann_date = input(strip(announcedate), anydtdte.);
+	format ann_date date9.;
+	sdc_year = year(ann_date);
+	if &START_YEAR <= sdc_year <= &END_YEAR;
+
+	keep master_cusip8 acq_cusip8 ann_date sdc_year deal_value;
+
+run;
+
+/*sanity cehck */
+
+proc contents data=sdc_clean; run;
+
+proc contents data=sdc_clean; run;
+
+/* prepare crsp for sdc link */
+
+data crsp_for_sdc;
+	set crsp;
+	length crsp_cusip8 $8;
+	crsp_cusip8 = substr(compress(upcase(strip(HdrCUSIP)),'-.'),1,8);
+	keep permno calyear crsp_cusip8;
+
+run;
+
+proc contents data=crsp_for_sdc; run;
+
+
+/* use CRSP prepared earlier; crsp_for_sdc with crsp_cusip8 (CHAR(8)) */
+
+proc sql;
+	/*Targets */
+
+	create table sdc_target as
+	select c.permno, s.sdc_year, s.deal_value
+	from crsp_for_sdc as c
+	inner join sdc_clean as s
+		on c.crsp_cusip8 = s.master_cusip8
+		and c.calyear    = s.sdc_year;
+
+	/*Acquirers */
+
+	create table sdc_acquirer as
+	select c.permno, s.sdc_year, s.deal_value
+	from crsp_for_sdc as c 
+	inner join sdc_clean as s
+		on c.crsp_cusip8 = s.acq_cusip8
+		and c.calyear    = s.sdc_year;
+
+quit;
+
+/* collapse to firm year */
+
+/* Targets  */
+
+proc means data=sdc_target nway noprint;
+	class permno sdc_year;
+	var deal_value;
+	output out=sdc_target_year (drop=_type_ _freq_)
+		n=deal_count_tgt
+		sum = total_deal_value_tgt;
+
+run;
+
+/* acquirers */
+
+proc means data = sdc_acquirer nway noprint;
+	class permno sdc_year;
+	var deal_value;
+	output out=sdc_acq_year (drop=_type_ _freq_)
+		n = deal_count_acq
+		sum = total_deal_value_acq;
+
+run;
+
+/* merge firm year summaries */
+
+data sdc_year;
+	merge sdc_target_year(rename=(sdc_year = year))
+		  sdc_acq_year(rename=(sdc_year = year));
+	by permno year;
+
+	if missing(deal_count_tgt) then deal_count_tgt=0;
+	if missing(deal_count_acq) then deal_count_acq=0;
+	if missing(total_deal_value_tgt) then total_deal_value_tgt=0;
+	if missing(total_deal_value_acq) then total_deal_value_acq=0;
+
+run;
+
+/*merge into spine (crsp+compustat +ibes )*/
+
+proc sql; 
+	create table spine_step3 as
+	select a.*,
+		b.deal_count_tgt, b.total_deal_value_tgt,
+		b.deal_count_acq, b.total_deal_value_acq
+	from spine_step2 as a
+	left join sdc_year as b
+		on a.permno = b.permno
+		and a.calyear = b.year;
+quit;
+
+
+
+/* importing msci data each year stack them together */
+
+%macro import_msci(y);
+	proc import datafile="msci_&y..csv"
+		out=msci_&y
+		dbms=csv
+		replace;
+		getnames=yes;
+		guessingrows=max;
+	run;
+
+%mend;
+
+%import_msci(2019);
+%import_msci(2020);
+%import_msci(2021);
+%import_msci(2022);
+%import_msci(2023);
+%import_msci(2024);
+
+data msci_raw;
+	set msci_2019-msci_2024;
+run;
+
+
+/* clean and standardize identifiers +dates */
+
+data msci_clean;
+	set msci_raw;
+	length cusip8 $8;
+
+	/* standardize identifiers */
+
+	cusip8 = substr(upcase(strip(cusip)),1,8);
+	isin   = upcase(strip(isin));
+	issuer_ticker = upcase(strip(ticker));
+
+	/* parse dates */
+
+	asof_date = input(strip(as_of_date),anydtdte.);
+	iva_rating_dt = input(strip(iva_rating_rate), anydtdte.);
+	format asof_date iva_rating_dt date9.;
+
+	/*restrict window */
+
+	esg_year = year(asof_date);
+	if 2019 <= esg_year <=2024;
+	
+
+	keep cusip8 isin issuer_ticker asof_date iva_rating_dt esg_year
+	IVA_COMPANY_RATING IVA_PREVIOUS_RATING
+	INDUSTRY_ADJUSTED_SCORE WEIGHTED_AVERAGE_SCORE
+	ENVIRONMENTAL_PILLAR_SCORE ENVIRONMENTAL_PILLAR_WEIGHT
+	SOCIAL_PILLAR_SCORE SOCIAL_PILLAR_WEIGHT
+	GOVERNANCE_PILLAR_SCORE GOVERNANCE_PILLAR_WEIGHT;
+
+run;
+
+
+/* prep crsp for linking (hdrCusip -> char(8) */
+
+data crsp_for_msci;
+	set crsp; /* from step 1 spine includes permno + calyear */
+	length crsp_cusip8 $8;
+	crsp_cusip8 = substr(upcase(strip(HdrCUSIP)),1,8);
+	keep permno calyear crsp_cusip8;
+
+run;
+
+
+/* link esg to crsp using CUSIP + year */
+
+proc sql;
+	create table msci_linked as 
+	select c.permno, c.calyear, m.*
+	from crsp_for_msci as c
+	inner join msci_clean as m
+		on c.crsp_cusip8 = m.cusip8
+		and c.calyear    = m.esg_year;
+quit;
+
+/* collapse to firm-year (keep the latest as_of_date) */
+
+proc sort date=msci_linked; by permno calyear asof_date; run;
+
+data msci_year;
+	set msci_linked;
+	by permno calyear;
+	if last.calyear; /* keep most recent record in that year */
+
+run;
+
+
+/* merge msci esg into spine_step3 */
+
+proc sql;
+	create table spine_step4 as
+	select a.*,
+			b.IVA_COMPANY_RATING, b.IVA_PREVIOUS_RATING,
+			b.INDUSTRY_ADJUSTED_SCORE, b.WEIGHTED_AVERAGE_SCORE,
+			b.ENVIRONMENTAL_PILLAR_SCORE, b.ENVIRONMENTAL_PILLAR_WEIGHT,
+			b.SOCIAL_PILLAR_SCORE, b.SOCIAL_PILLAR_WEIGHT,
+			b.GOVERNANCE_PILLAR_SCORE, b.GOVERNANCE_PILLAR_WEIGHT,
+			b.asof_date, b.iva_rating_dt
+	from spine_step3 as a 
+	left join msci_year as b
+		on a.permno = b.permno  /* check this part later it gives me error */
+		and a.calyear = b.calyear;
+
+quit;
+
+/* import boardex org summary analytics */
+
+proc import datafile = "BoardEx_Organization_Summary_Analytics.csv"
+	out=boardex_raw
+	dbms = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+
+run;
+
+
+/* import boardex crsp link (must include score) */
+
+proc import datafile = "BoardEx_CRSP_Compustat_Link.csv"
+	out = boardexlink_raw
+	dbsm = csv
+	replace;
+	getnames = yes;
+	guessingrows = max;
+
+run;
+
+
+/* keep only best matches */
+
+data boardexlink;
+	set boardexlink_raw;
+	if score = 1;
+	keep gvkey permco companyid score;
+
+	
+run;
+
+/* clean boardex data */
+
+data boardex_clean;
+	set boardex_raw;
+	gvkey = strip(gvkey); /* make sure gvkey matches ccm */
+
+	asof_date = input(strip(as_of_date), anydtdte.);
+	format asof_date date9.;
+	year = year(asof_date);
+
+	if 2019 <= year <= 2024;
+	if disclosed_earner_flag ne 1; /* exclude disclosed earners */
+
+run;
+
+/* merge boardex -> ccm to get permno */
+
+proc sql;
+	create table boardex_permno as 
+	select c.lpermno as permno, b.*
+	from boardex_clean as b
+	inner join ccm as c
+		on b.gvkey =c.gvkey
+		and b.asof_date between c.linkdt and c.linkenddt
+		where c.linktype in ("LU" ,  "LC")
+		and c.linkprim in ("P","C");
+quit;
+
+
+/* collapse to firm year averages */
+
+proc means data = boardex_permno nway noprint;
+	class permno year;
+	var _numeric_;  /* average all numeric vars */
+	output out=boardex_year (drop=_type_ _freq_) mean=;
+
+run;
+
+/* merge into spine_step4 */
+
+proc sql;
+	create table spine_step5 as 
+	select a.*, b.* 
+	from spine_step4 as a 
+	left join boardex_year as b
+		on a.permno = b.permno
+		and a.calyear = b.year;
+quit;
+
+
+
+
+
+
+/* final dataset and descriptive statistics */
+
+
+/* check for dublicates (permno - year ) */
+
+proc sort data = spine_step5 nodupkey out=final_dataset;
+
+	by permno calyear;
+
+run;
+
+/* confirm duplicates are gone */
+
+proc sql;
+	select count(*) as total_obs,
+		count(distinct catx('_', permno, calyear)) as unique_firmyears
+	from final_dataset;
+
+quit;
+
+
+/* export final dataset */
+
+/* save as sas dataset */
+
+libname out "C:\Users\ma2281\OneDrive - UNT System\Desktop\Week 5 Assignment";
+
+data out.final_dataset_mertakin;
+
+	set spine_step5;
+
+run;
+
+
+/* export to csv */
+
+proc export data = final_dataset
+	outfile = "final_dataset_mertakin.csv"
+	dbms = csv
+	replace;
+run;
+
+/* prepare dataset for descriptive stats */
+
+/* convert esg scores from char -> numeric */
+
+data final_dataset;
+	set spine_step5;
+
+	INDUSTRY_ADJUSTED_SCORE_num = input(strip(INDUSTRY_ADJUSTED_SCORE), best12.);
+	WEIGHTED_AVERAGE_SCORE_num = input(strip(WEIGHTED_AVERAGE_SCORE), best12.);
+
+	/* keep everything */
+
+run;
+
+
+/* check uniqueness (permno - year) */
+
+proc sort data = final_dataset nodupkey out = final_dataset;
+	by permno calyear;
+
+run;
+
+
+/* descriptive statistics */
+
+/* firm counts overall */
+
+proc sql;
+	select count(distinct permno) as unique_firms
+	from final_dataset;
+
+quit;
+
+/* coverage by year (firm counts per year) */
+
+proc sql;
+	create table firm_counts as
+	select calyear, count(distinct permno) as nfirms
+	from final_dataset
+	group by calyear
+	order by calyear;
+quit;
+
+
+proc sgplot data=firm_counts;
+	series x=calyear y=nfirms / markers;
+	title "Coverage by Year: number of firms per year";
+
+run;
+
+
+/* missing  data cheack */
+
+proc means data = final_dataset n nmiss;
+	var deal_count_tgt deal_count_acq total_deal_value_tgt total_deal_value_acq;
+run;
+
+
+
+
+/* summary stats for numeric variables */
+
+
+/* burdan devam et asagida sonuclar 0 veya bos */
+
+proc means data = final_dataset n mean median std min max;
+	var deal_count_tgt deal_count_acq total_deal_value_tgt total_deal_value_acq
+		INDUSTRY_ADJUSTED_SCORE_num WEIGHTED_AVERAGE_SCORE_num;
+
+run;
+
+/* frequency table for categorical esg rating */
+
+proc freq data=final_dataset;
+
+	tables IVA_COMPANY_RATING;
+run;
+
+
+proc contents data=final_dataset; run;
